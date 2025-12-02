@@ -1,7 +1,8 @@
 import { createWriteStream, createReadStream } from 'fs';
 import { pipeline } from 'stream/promises';
-import { mkdir, readFile, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { mkdir, readFile, writeFile, rm, rename } from 'fs/promises';
+import { join, dirname } from 'path';
+import { patchFileAst, defaultDroidPatchConfig } from './ast_patcher.js';
 
 interface DroidDownloadInfo {
   binaryUrl: string;
@@ -101,84 +102,92 @@ async function downloadFile(url: string, filePath: string): Promise<void> {
 async function removeDroidHeader(filePath: string, outputPath: string): Promise<void> {
   try {
     console.log(`开始处理droid.exe文件: ${filePath}`);
-    
+
     // 读取文件内容
     let fileBuffer = await readFile(filePath);
-    
-    // 要移除的头部内容的十六进制表示
-    // 8F 67 7F 01 42 3A 2F 7E 42 55 4E 2F 72 6F 6F 74 2F 64 72 6F 69 64 2E 65 78 65 00 2F 2F 20 40 62 75 6E 0A
-    const headerToRemove = Buffer.from([
-      0x8F, 0x67, 0x7F, 0x01, 0x42, 0x3A, 0x2F, 0x7E,
-      0x42, 0x55, 0x4E, 0x2F, 0x72, 0x6F, 0x6F, 0x74,
-      0x2F, 0x64, 0x72, 0x6F, 0x69, 0x64, 0x2E, 0x65,
-      0x78, 0x65, 0x00, 0x2F, 0x2F, 0x20, 0x40, 0x62,
-      0x75, 0x6E, 0x0A
+
+    // 头部特征模式：B:/~BUN/root/droid.exe\0// @bun\n
+    // 42 3A 2F 7E 42 55 4E 2F 72 6F 6F 74 2F 64 72 6F 69 64 2E 65 78 65 00 2F 2F 20 40 62 75 6E 0A
+    const signaturePattern = Buffer.from([
+      0x42, 0x3A, 0x2F, 0x7E, 0x42, 0x55, 0x4E, 0x2F,
+      0x72, 0x6F, 0x6F, 0x74, 0x2F, 0x64, 0x72, 0x6F,
+      0x69, 0x64, 0x2E, 0x65, 0x78, 0x65, 0x00, 0x2F,
+      0x2F, 0x20, 0x40, 0x62, 0x75, 0x6E, 0x0A
     ]);
-    
-    // 要移除的尾部内容的十六进制表示
-    // 0A 0A 2F 2F 23 20 64 65 62 75 67 49 64 3D 43 42 33 36 30 31 35 33 31 31 38 43 35 32 33 36 36 34 37 35 36 45 32 31 36 34 37 35 36 45 32 31
-    const tailToRemove = Buffer.from([
-      0x0A, 0x0A, 0x2F, 0x2F, 0x23, 0x20, 0x64, 0x65,
-      0x62, 0x75, 0x67, 0x49, 0x64, 0x3D, 0x43, 0x42,
-      0x33, 0x36, 0x30, 0x31, 0x35, 0x33, 0x31, 0x31,
-      0x38, 0x43, 0x35, 0x32, 0x33, 0x36, 0x36, 0x34,
-      0x37, 0x35, 0x36, 0x45, 0x32, 0x31, 0x36, 0x34,
-      0x37, 0x35, 0x36, 0x45, 0x32, 0x31
+
+    // 尾部特征模式：//# debugId=
+    // 2F 2F 23 20 64 65 62 75 67 49 64 3D
+    const tailSignaturePattern = Buffer.from([
+      0x2F, 0x2F, 0x23, 0x20, 0x64, 0x65, 0x62, 0x75,
+      0x67, 0x49, 0x64, 0x3D
     ]);
-    
-    // 第一步：移除头部及之前的所有内容
-    let headerIndex = -1;
-    for (let i = 0; i <= fileBuffer.length - headerToRemove.length; i++) {
+
+    // 第一步：查找头部特征模式
+    let signatureIndex = -1;
+    for (let i = 0; i <= fileBuffer.length - signaturePattern.length; i++) {
       let match = true;
-      for (let j = 0; j < headerToRemove.length; j++) {
-        if (fileBuffer[i + j] !== headerToRemove[j]) {
+      for (let j = 0; j < signaturePattern.length; j++) {
+        if (fileBuffer[i + j] !== signaturePattern[j]) {
           match = false;
           break;
         }
       }
       if (match) {
-        headerIndex = i;
+        signatureIndex = i;
         break;
       }
     }
-    
-    if (headerIndex === -1) {
-      console.log('未找到指定的头部内容，直接复制文件');
+
+    if (signatureIndex === -1) {
+      console.log('未找到指定的头部特征模式，直接复制文件');
       await writeFile(outputPath, fileBuffer);
       return;
     }
-    
+
+    console.log(`找到头部特征模式位置: ${signatureIndex}`);
+
+    // 头部需要移除：从文件开头到特征模式结束的位置（不向后截取额外字节）
+    const headerEndIndex = signatureIndex + signaturePattern.length;
+
     // 移除头部及之前的所有内容
-    fileBuffer = fileBuffer.slice(headerIndex + headerToRemove.length);
-    console.log(`已移除头部及之前的内容，剩余 ${fileBuffer.length} 字节`);
-    
-    // 第二步：查找并移除尾部内容及其之后的所有内容
-    let tailIndex = -1;
-    for (let i = 0; i <= fileBuffer.length - tailToRemove.length; i++) {
+    fileBuffer = fileBuffer.slice(headerEndIndex);
+    console.log(`已移除头部（从0到${headerEndIndex}），剩余 ${fileBuffer.length} 字节`);
+
+    // 第二步：从文件尾部倒序查找尾部特征模式 //# debugId=（找最后一次出现）
+    let tailSignatureIndex = -1;
+    for (let i = fileBuffer.length - tailSignaturePattern.length; i >= 0; i--) {
       let match = true;
-      for (let j = 0; j < tailToRemove.length; j++) {
-        if (fileBuffer[i + j] !== tailToRemove[j]) {
+      for (let j = 0; j < tailSignaturePattern.length; j++) {
+        if (fileBuffer[i + j] !== tailSignaturePattern[j]) {
           match = false;
           break;
         }
       }
       if (match) {
-        tailIndex = i;
-        break;
+        tailSignatureIndex = i;
+        break;  // 找到最后一次出现就停止
       }
     }
-    
-    if (tailIndex !== -1) {
-      // 移除尾部内容及其之后的所有内容
-      fileBuffer = fileBuffer.slice(0, tailIndex);
-      console.log(`已移除尾部及之后的内容，剩余 ${fileBuffer.length} 字节`);
+
+    if (tailSignatureIndex !== -1) {
+      console.log(`找到尾部特征模式 //# debugId= 位置（最后一次出现）: ${tailSignatureIndex}`);
+
+      // 输出匹配位置前2个字节的十六进制（用于调试）
+      if (tailSignatureIndex >= 2) {
+        const before2Bytes = fileBuffer.slice(tailSignatureIndex - 2, tailSignatureIndex);
+        console.log(`特征模式前2个字节: ${Array.from(before2Bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+      }
+
+      // 尾部需要移除：从特征模式的位置开始截断（不向前截取）
+      fileBuffer = fileBuffer.slice(0, tailSignatureIndex);
+      console.log(`已移除尾部（从${tailSignatureIndex}开始），剩余 ${fileBuffer.length} 字节`);
     } else {
-      console.log('未找到指定的尾部内容，保留所有剩余内容');
+      console.log('未找到指定的尾部特征模式 //# debugId=，保留所有剩余内容');
     }
-    
+
     // 写入处理后的文件
     await writeFile(outputPath, fileBuffer);
-    
+
     console.log(`文件处理完成，输出到: ${outputPath}`);
     console.log(`最终处理后文件大小: ${fileBuffer.length} 字节`);
   } catch (error) {
@@ -210,9 +219,43 @@ async function downloadAndProcessDroid(outputDir: string = './droid'): Promise<v
     // 移除文件头部内容
     const processedPath = join(outputDir, 'droid_processed.js');
     await removeDroidHeader(binaryPath, processedPath);
-    
-    console.log(`Windows x64版本的droid文件下载并处理完成，位于: ${outputDir}`);
+
+    // 使用 Babel 进行 AST patch
+    console.log('\n开始进行 AST patch...');
+    const patchedPath = join(outputDir, 'droid_patched.js');
+    await patchFileAst(processedPath, patchedPath, defaultDroidPatchConfig);
+
+    // 创建 package 目录（与 outputDir 同级）
+    console.log('\n创建 package 目录...');
+    const parentDir = dirname(outputDir);
+    const packageDir = join(parentDir, 'package');
+    await mkdir(packageDir, { recursive: true });
+
+    // 复制处理后的文件到 package 目录，使用 .cjs 扩展名表示 CommonJS
+    const packageMainFile = join(packageDir, 'index.cjs');
+    await writeFile(packageMainFile, await readFile(patchedPath));
+
+    // 创建 package.json (CommonJS 格式)
+    const packageJson = {
+      name: 'droid-patched',
+      version: downloadInfo.version,
+      main: 'index.cjs',
+      dependencies: {
+        'ws': '^8.18.0'
+      }
+    };
+    await writeFile(
+      join(packageDir, 'package.json'),
+      JSON.stringify(packageJson, null, 2)
+    );
+
+    // 删除 tmp 目录
+    console.log(`\n删除临时目录: ${outputDir}`);
+    await rm(outputDir, { recursive: true, force: true });
+
+    console.log(`\nWindows x64版本的droid文件下载并处理完成`);
     console.log(`版本: ${downloadInfo.version}`);
+    console.log(`Package 目录: ${packageDir}`);
   } catch (error) {
     console.error(`下载并处理 Windows x64版本droid文件失败: ${error}`);
     throw error;
