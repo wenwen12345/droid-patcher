@@ -1,6 +1,6 @@
 import { createWriteStream, createReadStream } from 'fs';
 import { pipeline } from 'stream/promises';
-import { mkdir, readFile, writeFile, rm, rename } from 'fs/promises';
+import { mkdir, readFile, writeFile, rm, rename, access } from 'fs/promises';
 import { join, dirname } from 'path';
 import { patchFileAst, defaultDroidPatchConfig } from './ast_patcher.js';
 
@@ -10,6 +10,41 @@ interface DroidDownloadInfo {
   ripgrepUrl: string;
   ripgrepSha256Url: string;
   version: string;
+}
+
+interface DroidConfig {
+  packageName: string;
+  version: string;
+  bin_name: string;
+}
+
+/**
+ * 读取配置文件
+ * @param configPath 配置文件路径
+ */
+async function readConfig(configPath: string): Promise<DroidConfig> {
+  try {
+    await access(configPath);
+    const configContent = await readFile(configPath, 'utf-8');
+    return JSON.parse(configContent);
+  } catch (error) {
+    // 配置文件不存在或读取失败，返回默认配置
+    return {
+      packageName: 'droid-patched',
+      version: '',
+      bin_name: 'droid'
+    };
+  }
+}
+
+/**
+ * 写入配置文件
+ * @param configPath 配置文件路径
+ * @param config 配置对象
+ */
+async function writeConfig(configPath: string, config: DroidConfig): Promise<void> {
+  await writeFile(configPath, JSON.stringify(config, null, 2));
+  console.log(`配置文件已更新: ${configPath}`);
 }
 
 async function fetch_version_from_cli(): Promise<string> {
@@ -199,13 +234,30 @@ async function removeDroidHeader(filePath: string, outputPath: string): Promise<
 /**
  * 下载Windows版本的droid文件并移除特定头部内容
  * @param outputDir 输出目录，默认为当前目录下的'droid'
+ * @param configPath 配置文件路径，默认为'./config.json'
  */
-async function downloadAndProcessDroid(outputDir: string = './droid'): Promise<void> {
+async function downloadAndProcessDroid(
+  outputDir: string = './droid',
+  configPath: string = './config.json'
+): Promise<void> {
   try {
     console.log('开始下载 Windows x64版本的droid文件...');
-    
+
+    // 读取当前配置
+    const config = await readConfig(configPath);
+    console.log(`当前配置版本: ${config.version || '无'}`);
+
     // 获取Windows x64版本的下载信息
     const downloadInfo = await fetch_droid_download_link('windows', 'x64', true);
+    console.log(`远程版本: ${downloadInfo.version}`);
+
+    // 检查版本是否相同
+    if (config.version && config.version === downloadInfo.version) {
+      console.log('版本相同，无需重新下载和处理');
+      return;
+    }
+
+    console.log('版本不同或首次运行，开始下载...');
     console.log(downloadInfo);
     
     // 创建输出目录
@@ -237,9 +289,12 @@ async function downloadAndProcessDroid(outputDir: string = './droid'): Promise<v
 
     // 创建 package.json (CommonJS 格式)
     const packageJson = {
-      name: 'droid-patched',
+      name: config.packageName,
       version: downloadInfo.version,
       main: 'index.cjs',
+      bin: {
+        [config.bin_name]: 'index.cjs'
+      },
       dependencies: {
         'ws': '^8.18.0'
       }
@@ -253,7 +308,12 @@ async function downloadAndProcessDroid(outputDir: string = './droid'): Promise<v
     console.log(`\n删除临时目录: ${outputDir}`);
     await rm(outputDir, { recursive: true, force: true });
 
+    // 更新配置文件版本
+    config.version = downloadInfo.version;
+    await writeConfig(configPath, config);
+
     console.log(`\nWindows x64版本的droid文件下载并处理完成`);
+    console.log(`包名: ${config.packageName}`);
     console.log(`版本: ${downloadInfo.version}`);
     console.log(`Package 目录: ${packageDir}`);
   } catch (error) {

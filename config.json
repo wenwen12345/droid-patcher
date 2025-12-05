@@ -1,0 +1,5 @@
+{
+  "packageName": "@echoflux/droid-patched",
+  "version": "0.31.0",
+  "bin_name": "droid-patch"
+}
