@@ -1,0 +1,62 @@
+name: Build and Publish Droid Package
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # 每天UTC时间0点运行(北京时间8点)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.1
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build project
+        run: pnpm build
+
+      - name: Run index.ts (Download and Process Droid)
+        run: node dist/index.js
+        env:
+          NODE_ENV: production
+
+      - name: Setup .npmrc for Verdaccio
+        run: |
+          cd package
+          echo "registry=${{ secrets.NPM_REGISTRY }}" > .npmrc
+          echo "//${{ secrets.NPM_REGISTRY_HOST }}/:_authToken=${{ secrets.NPM_TOKEN }}" >> .npmrc
+
+      - name: Publish to Verdaccio
+        run: |
+          cd package
+          npm publish
+        continue-on-error: true
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: droid-package
+          path: package/
+          retention-days: 30
+
+      - name: Notification
+        if: failure()
+        run: echo "构建或发布失败,请检查日志"
